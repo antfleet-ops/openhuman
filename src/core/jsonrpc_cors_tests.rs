@@ -5,6 +5,13 @@ use axum::response::{IntoResponse, Response};
 
 use super::{is_origin_allowed, with_cors_headers, ALLOWED_ORIGINS_ENV};
 
+// Guards process-global env mutations in `env_override_allows_extra_origins`.
+// Tests that call `is_origin_allowed` (which reads ALLOWED_ORIGINS_ENV) take a
+// shared read lock; the env-mutating test takes the exclusive write lock. This
+// prevents the mutation window from racing with origin checks running in other
+// test threads.
+static ENV_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
 fn ok_response() -> Response {
     (StatusCode::OK, "").into_response()
 }
@@ -19,6 +26,7 @@ fn allow_origin(response: &Response) -> Option<String> {
 
 #[test]
 fn allows_tauri_webview_origins() {
+    let _guard = ENV_LOCK.read().unwrap();
     for origin in [
         "tauri://localhost",
         "http://tauri.localhost",
@@ -32,6 +40,7 @@ fn allows_tauri_webview_origins() {
 
 #[test]
 fn allows_loopback_with_any_port() {
+    let _guard = ENV_LOCK.read().unwrap();
     for origin in [
         "http://127.0.0.1:1420",
         "http://localhost:5173",
@@ -46,6 +55,7 @@ fn allows_loopback_with_any_port() {
 
 #[test]
 fn rejects_disallowed_origins() {
+    let _guard = ENV_LOCK.read().unwrap();
     for origin in [
         "https://attacker.example",
         "http://evil.localhost.attacker.example",
@@ -68,6 +78,7 @@ fn rejects_disallowed_origins() {
 
 #[test]
 fn missing_origin_emits_no_acao_but_sets_vary() {
+    let _guard = ENV_LOCK.read().unwrap();
     let r = with_cors_headers(ok_response(), None);
     assert!(allow_origin(&r).is_none());
     assert_eq!(
@@ -78,9 +89,10 @@ fn missing_origin_emits_no_acao_but_sets_vary() {
 
 #[test]
 fn env_override_allows_extra_origins() {
-    // SAFETY: this test mutates a process-global env var. No other test in
-    // this crate reads ALLOWED_ORIGINS_ENV, so parallel runs are safe; we
-    // still restore the previous value on exit to be a good citizen.
+    // Hold the write lock for the entire test so no other test can observe
+    // a partially-mutated ALLOWED_ORIGINS_ENV. All sibling tests that call
+    // is_origin_allowed take the corresponding read lock (see ENV_LOCK above).
+    let _guard = ENV_LOCK.write().unwrap();
     let prev = std::env::var(ALLOWED_ORIGINS_ENV).ok();
     unsafe {
         std::env::set_var(
@@ -105,6 +117,7 @@ fn env_override_allows_extra_origins() {
 
 #[test]
 fn always_sets_methods_headers_and_max_age() {
+    let _guard = ENV_LOCK.read().unwrap();
     let r = with_cors_headers(ok_response(), Some("tauri://localhost"));
     let h = r.headers();
     assert_eq!(
@@ -121,5 +134,10 @@ fn always_sets_methods_headers_and_max_age() {
         h.get(header::ACCESS_CONTROL_MAX_AGE)
             .and_then(|v| v.to_str().ok()),
         Some("86400")
+    );
+    assert_eq!(
+        h.get(header::VARY).and_then(|v| v.to_str().ok()),
+        Some("Origin"),
+        "Vary: Origin must be set even when origin is allowed so caches vary responses correctly"
     );
 }
